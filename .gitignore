@@ -1,0 +1,10 @@
+crops/
+crops_test/
+ckpts/*
+object-tracking-crops-data.tar.gz
+deep_sort/deep_sort/__pycache__/*
+deep_sort/application_util/__pycache__/*
+
+*.avi
+deep_sort/application_util/__pycache__/*
+deep_sort/deep_sort/__pycache__/*
