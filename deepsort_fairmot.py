@@ -14,6 +14,9 @@ from scipy.optimize import linear_sum_assignment
 # Asta e DeepSort Trackerul
 from deepsort import deepsort_rbc
 from multitracker2 import JDETracker
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 
 
 def draw_rect(image, xy1, xy2):
@@ -79,9 +82,9 @@ def hungarian_matching(active_luggage_tracks, active_person_tracks, dist_thresh=
 
     row_ind, col_ind = linear_sum_assignment(assig_matrix)
     luggage_to_person_mapping = {}
-    for i in range(len(assig_matrix)):
-        row_id = luggage_index[row_ind[i]]
-        col_id = person_index[col_ind[i]]
+    for row, col in zip(row_ind, col_ind):
+        row_id = luggage_index[row]
+        col_id = person_index[col]
         luggage_to_person_mapping[row_id] = col_id
 
     return  luggage_to_person_mapping
@@ -99,7 +102,7 @@ class CounterProvider(object):
 
 
 OPT = namedtuple('OPT', 'conf_thres, track_buffer, nms_thres, min_box_area')
-opt = OPT(0.2, 100, 0.4, 100)
+opt = OPT(0.2, 10, 0.4, 100)
 counter_provider = CounterProvider()
 tracker = JDETracker(opt, counter_provider=counter_provider)
 deepsort_person = deepsort_rbc(wt_path='ckpts/model640.pt')
@@ -111,7 +114,7 @@ cap = VideoCapture(sys.argv[1])
 vid_length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
 frame_list = []
-dict_counter = []
+dict_counter = {}
 print(
     f"Processing images from video {sys.argv[1]} with detections from {sys.argv[2]}")
 l_to_p_mapping_total = {}
@@ -128,19 +131,19 @@ for count in tqdm.tqdm(range(vid_length)):
     dets = dets[dets['confidence'] > 0.4]
     luggage_dets = dets[(dets['name'] == 'backpack') | (
         dets['name'] == 'suitcase') | (dets['name'] == 'handbag')]
-    person_dets = dets[[dets['name'] == 'person']]
+    person_dets = dets[(dets['name'] == 'person')]
 
     if luggage_dets.empty or person_dets.empty:
         continue
 
     online_luggages = tracker.update(
-        dets[['xcenter', 'ycenter', 'width', 'height', 'confidence']].values.astype(float))
+        luggage_dets[['xcenter', 'ycenter', 'width', 'height', 'confidence']].values.astype(float))
 
-    people_scrs = people_dets['confidence'].values.astype(float)
-    people_dets = deepsort_person.format_yolo_output(
-        people_dets[['xcenter', 'ycenter', 'width', 'height']].values.astype(float))
+    people_scrs = person_dets['confidence'].values.astype(float)
+    person_dets = deepsort_person.format_yolo_output(
+        person_dets[['xcenter', 'ycenter', 'width', 'height']].values.astype(float))
     person_tracker , _ = deepsort_person.run_deep_sort(
-                frame, people_scrs, people_dets)
+                frame, people_scrs, person_dets)
 
     # next step: Hungarian assignment
     online_persons = [el for el in person_tracker.tracks if el.is_confirmed() or el.time_since_update > 1]
@@ -148,7 +151,7 @@ for count in tqdm.tqdm(range(vid_length)):
     l_to_p_mapping_total.update(l_to_p_mapping) # keep person to luggage matching in mind for all frames
 
     for track in online_luggages:
-        tid = track.tid
+        tid = track.track_id
         x, y, w, h = track.tlwh
         x1, y1, x2, y2 = xywh2xyxy(track.tlwh).astype(int)
         cropped_img = frame_for_cropping[y1:y2,x1:x2] # we only crop luggages
@@ -160,7 +163,7 @@ for count in tqdm.tqdm(range(vid_length)):
             dict_counter[tid] = 0
         p_id = str(l_to_p_mapping_total.get(tid, ''))
         n = dict_counter[tid]
-        filename = 'p{p_id}_{tid}_{n}.jpg'
+        filename = f'p{p_id}_{tid}_{n}.jpg'
         p1 = int(x1), int(y1)
         p2 = int(x2), int(y2)
         p_c = int(x), int(y)
