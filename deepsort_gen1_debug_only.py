@@ -59,26 +59,35 @@ def xywh2xyxy_multiple(x):
     y[:,3] = x[:,1] + x[:,3] / 2  # bottom right y
     return y
 
+def tlwh2xywh(tlwh):
+    x1, y1, w, h = tlwh
+    xc = x1 + w/2
+    yc = y1 + h/2
+    return xc, yc, w, h
 
-def hungarian_matching(active_luggage_tracks, active_person_tracks, dist_thresh=175):
+def hungarian_matching(active_luggage_tracks, active_person_tracks, dist_thresh=0.65):
     # Luggage is from FairMOT and Person is from DeepSORT
     luggage_index = {}
     person_index = {}
     assig_matrix = np.matrix(np.ones((len(active_luggage_tracks), len(active_person_tracks))) * 9e3)
-
+    ignore_pair = []
     for i, l_track in enumerate(active_luggage_tracks):
         luggage_index[i] = l_track.track_id
-        luggage_center = l_track.tlwh
-
+        luggage_center = tlwh2xywh(l_track.to_tlwh())
+        lx, ly, lw, lh = luggage_center
         for j, p_track in enumerate(active_person_tracks):
             person_index[j] = p_track.track_id
-            person_center = p_track.to_tlwh()
-
-            dist = np.linalg.norm(luggage_center - person_center)
-
+            person_center = tlwh2xywh(p_track.to_tlwh())
+            px, py, pw, ph = person_center
+            #dist = np.linalg.norm(luggage_center - person_center)
+            dist = abs(px - lx) / abs(lw + pw)
+            dist += abs(py - ly) / abs(ph + lh)
+            #print(f"DISTANCE IS {dist}")
             # Feel free to change this daca gasesti ceva mai bun
             if dist <= dist_thresh:
                 assig_matrix[i, j] = dist
+            else:
+                ignore_pair.append((i,j))
 
     # Asta e practic hungarian assignment asta iti returneaza practic 2 liste 1 cu row indexes si
     # cealalta cu column indexes si atunci practic row_ind[i] vine assigned la col_ind[i]
@@ -93,6 +102,8 @@ def hungarian_matching(active_luggage_tracks, active_person_tracks, dist_thresh=
     for row, col in zip(row_ind, col_ind):
         row_id = luggage_index[row]
         col_id = person_index[col]
+        if (row, col) in ignore_pair:
+            continue
         luggage_to_person_mapping[row_id] = col_id
 
     return  luggage_to_person_mapping
@@ -123,7 +134,7 @@ def draw_tracks(online_tracks, frame, color=(0,0,255)):
         frame = draw_rect(frame, p1, p2, color)
         frame = draw_id(frame, str(tid), p_c, color=color)
     return frame
-
+    
 class CounterProvider(object):
     def __init__(self):
         self.object_counter = 0
@@ -133,7 +144,7 @@ class CounterProvider(object):
         self.object_counter += 1
         return val
 
-
+ORANGE_COLOR = (0, 165, 255)
 OPT = namedtuple('OPT', 'conf_thres, track_buffer, nms_thres, min_box_area')
 opt = OPT(0.2, 10, 0.4, 100)
 counter_provider = CounterProvider()
@@ -146,6 +157,11 @@ vid_length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
 frame_list = []
 dict_counter = {}
+abandoned_by = {}
+abandoned_coords = {}
+truly_abandoned_by = {}
+consecutive_abandoned = {} # 'id' -> frames obj is stationary
+suspicious_recovered_by = {}
 print(
     f"Processing images from video {sys.argv[1]} with detections from {sys.argv[2]}")
 l_to_p_mapping_total = {}
@@ -166,25 +182,76 @@ for count in tqdm.tqdm(range(vid_length)):
     
     person_dets = dets[(dets['name'] == 'person')]
 
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     if luggage_dets.empty:
         # potential for visual tracking from previous frame
-        online_luggages_tracks = deepsort_luggage.run_deep_sort(frame, [], [])
+        online_luggage_tracks = deepsort_luggage.run_deep_sort(img_rgb, [], [])
     else:
         luggage_scrs, luggage_dets_vals = preprocess_csv_vals(luggage_dets, deepsort_luggage.format_yolo_output)
-        online_luggages, _ = deepsort_luggage.run_deep_sort(
-                    frame, luggage_scrs, luggage_dets_vals)
-        online_luggages_tracks = online_luggages.tracks
+        online_luggage, _ = deepsort_luggage.run_deep_sort(
+                    img_rgb, luggage_scrs, luggage_dets_vals)
+        online_luggage_tracks = online_luggage.tracks
 
     if person_dets.empty:
-        online_person_tracks = deepsort_person.run_deep_sort(frame, [], [])
+        online_person_tracks = deepsort_person.run_deep_sort(img_rgb, [], [])
     else:
         person_scrs, person_dets_vals = preprocess_csv_vals(person_dets, deepsort_person.format_yolo_output)
-        online_persons, _ = deepsort_person.run_deep_sort(frame, person_scrs, person_dets_vals)
+        online_persons, _ = deepsort_person.run_deep_sort(img_rgb, person_scrs, person_dets_vals)
         online_person_tracks = online_persons.tracks
 
+    DIST_THRESH=1 # distance scaled by size
+    MOTION_DIST_THRESH =  5 #motion threshold for object to be considered stationary
+    MOTION_STOP_FRAMES = 15 # how many frames the abandoned object stopped moving
+    # two to one mapping maximum, we assume people can hold a maximum of two baggages
+    l_to_p_map = hungarian_matching(online_luggage_tracks, online_person_tracks, dist_thresh=DIST_THRESH)
+    unmatched_luggage_tracks = [track for track in online_luggage_tracks if track.track_id not in l_to_p_map.keys()]
+    l_to_p_map2 = hungarian_matching(unmatched_luggage_tracks, online_person_tracks, dist_thresh=DIST_THRESH)
+    l_to_p_map.update(l_to_p_map2)
 
-    frame = draw_tracks(online_luggages_tracks, frame, color=(0,255,0))
-    frame = draw_tracks(online_person_tracks, frame, color=(255,0,0))
+    for luggage_track in online_luggage_tracks:
+        l_id = luggage_track.track_id 
+        if l_id not in l_to_p_map:
+            if l_id not in abandoned_by:
+                abandoned_by[l_id] = str(l_to_p_mapping_total.get(l_id, 'unknown'))
+                abandoned_coords[l_id] = tlwh2xywh(luggage_track.to_tlwh())
+            else:
+                prev_coords = abandoned_coords[l_id]
+                current_coords = tlwh2xywh(luggage_track.to_tlwh())
+                px, py, _, _ = prev_coords
+                cx, cy, _, _ = current_coords
+                if abs(px - cx) + abs(py - cy) <= MOTION_DIST_THRESH:
+                    consecutive_abandoned[l_id] = consecutive_abandoned.get(l_id, 0) + 1
+                else:
+                    consecutive_abandoned[l_id] = 0
+
+        if consecutive_abandoned.get(l_id, 0) >= MOTION_STOP_FRAMES:
+            truly_abandoned_by[l_id] = str(l_to_p_mapping_total.get(l_id, 'unknown'))
+            continue
+        
+        if l_id in l_to_p_map and l_id in truly_abandoned_by.keys():
+            # recovered baggage, trigger matching of baggage with person
+            abandoned_by_p = truly_abandoned_by[l_id] # person id
+            recovered_by_p = l_to_p_map[l_id]
+            if str(abandoned_by) != (recovered_by_p): # we can use siamese_net here
+                suspicious_recovered_by[l_id] = recovered_by_p
+            truly_abandoned_by.pop(l_id)
+    
+    l_to_p_mapping_total.update(l_to_p_map)
+
+    abandoned_people = [track for track in online_person_tracks if str(track.track_id) in truly_abandoned_by.values()]
+    abandoned_luggages = [track for track in online_luggage_tracks if track.track_id in truly_abandoned_by.keys()]
+    frame = draw_tracks(abandoned_people, frame, color=(0,0,255))
+    frame = draw_tracks(abandoned_luggages, frame, color=(0,0,255))
+
+    supicious_people = [track for track in online_person_tracks if str(track.track_id) in suspicious_recovered_by.values()]
+    suspicious_luggages = [track for track in online_luggage_tracks if track.track_id in suspicious_recovered_by.keys()]
+    frame = draw_tracks(abandoned_people, frame, color=ORANGE_COLOR)
+    frame = draw_tracks(abandoned_luggages, frame, color=ORANGE_COLOR)
+
     frame_list.append(frame)
+    # FOR DEBUGGING
+    # frame = draw_tracks(online_luggages_tracks, frame, color=(0,255,0))
+    # frame = draw_tracks(online_person_tracks, frame, color=(255,0,0))
+    # frame_list.append(frame)
 
 write_video(VIDEO_OUT_PATH, frame_list, fps=25)
