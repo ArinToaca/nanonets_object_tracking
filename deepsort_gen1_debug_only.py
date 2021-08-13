@@ -199,7 +199,7 @@ for count in tqdm.tqdm(range(vid_length)):
         online_persons, _ = deepsort_person.run_deep_sort(img_rgb, person_scrs, person_dets_vals)
         online_person_tracks = online_persons.tracks
 
-    DIST_THRESH=1 # distance scaled by size
+    DIST_THRESH=1 # distance scaled by size, [0,1], smaller should mean more strict
     MOTION_DIST_THRESH =  5 #motion threshold for object to be considered stationary
     MOTION_STOP_FRAMES = 15 # how many frames the abandoned object stopped moving
     # two to one mapping maximum, we assume people can hold a maximum of two baggages
@@ -222,36 +222,41 @@ for count in tqdm.tqdm(range(vid_length)):
                 if abs(px - cx) + abs(py - cy) <= MOTION_DIST_THRESH:
                     consecutive_abandoned[l_id] = consecutive_abandoned.get(l_id, 0) + 1
                 else:
-                    consecutive_abandoned[l_id] = 0
-
-        if consecutive_abandoned.get(l_id, 0) >= MOTION_STOP_FRAMES:
-            truly_abandoned_by[l_id] = str(l_to_p_mapping_total.get(l_id, 'unknown'))
-            continue
-        
-        if l_id in l_to_p_map and l_id in truly_abandoned_by.keys():
+                    consecutive_abandoned[l_id] = 0   
+        elif l_id in l_to_p_map and l_id in truly_abandoned_by.keys():
             # recovered baggage, trigger matching of baggage with person
             abandoned_by_p = truly_abandoned_by[l_id] # person id
             recovered_by_p = l_to_p_map[l_id]
             if str(abandoned_by) != (recovered_by_p): # we can use siamese_net here
                 suspicious_recovered_by[l_id] = recovered_by_p
             truly_abandoned_by.pop(l_id)
+            consecutive_abandoned.pop(l_id, 0)
+
+        if consecutive_abandoned.get(l_id, 0) >= MOTION_STOP_FRAMES:
+            truly_abandoned_by[l_id] = str(l_to_p_mapping_total.get(l_id, 'unknown'))
+            consecutive_abandoned.pop(l_id, 0)
     
     l_to_p_mapping_total.update(l_to_p_map)
+
+    frame = draw_tracks(online_person_tracks, frame, color=(0,255,0))
+    frame = draw_tracks(online_luggage_tracks, frame, color=(0,255,0))
+
+    suspicious_people = [track for track in online_person_tracks if str(track.track_id) in suspicious_recovered_by.values()]
+    suspicious_luggages = [track for track in online_luggage_tracks if track.track_id in suspicious_recovered_by.keys()]
+    frame = draw_tracks(suspicious_people, frame, color=ORANGE_COLOR)
+    frame = draw_tracks(suspicious_luggages, frame, color=ORANGE_COLOR)
 
     abandoned_people = [track for track in online_person_tracks if str(track.track_id) in truly_abandoned_by.values()]
     abandoned_luggages = [track for track in online_luggage_tracks if track.track_id in truly_abandoned_by.keys()]
     frame = draw_tracks(abandoned_people, frame, color=(0,0,255))
     frame = draw_tracks(abandoned_luggages, frame, color=(0,0,255))
 
-    supicious_people = [track for track in online_person_tracks if str(track.track_id) in suspicious_recovered_by.values()]
-    suspicious_luggages = [track for track in online_luggage_tracks if track.track_id in suspicious_recovered_by.keys()]
-    frame = draw_tracks(abandoned_people, frame, color=ORANGE_COLOR)
-    frame = draw_tracks(abandoned_luggages, frame, color=ORANGE_COLOR)
-
-    frame_list.append(frame)
     # FOR DEBUGGING
-    # frame = draw_tracks(online_luggages_tracks, frame, color=(0,255,0))
-    # frame = draw_tracks(online_person_tracks, frame, color=(255,0,0))
-    # frame_list.append(frame)
+    # ok_luggage_tracks = [track for track in online_luggage_tracks if track.track_id not in truly_abandoned_by or track.track_id not in suspicious_recovered_by]
+    # ok_person_tracks = [track for track in online_person_tracks if track.track_id not in truly_abandoned_by.values() or track.track_id not in suspicious_recovered_by.values()]
+
+    # frame = draw_tracks(ok_luggage_tracks, frame, color=(0,255,0))
+    # frame = draw_tracks(ok_person_tracks, frame, color=(0,255,0))
+    frame_list.append(frame)
 
 write_video(VIDEO_OUT_PATH, frame_list, fps=25)
